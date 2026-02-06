@@ -2,6 +2,39 @@ import { createAdminClient } from "@/lib/supabase/server"
 import { NextRequest, NextResponse } from "next/server"
 import * as XLSX from "xlsx"
 
+// Helper untuk membersihkan string
+const cleanString = (val: any) => {
+  if (!val) return null
+  const str = String(val).trim()
+  if (str === "-" || str === "" || str.toLowerCase() === "null") return null
+  return str
+}
+
+// Helper untuk parsing tanggal Excel (Serial Number) atau String
+const parseExcelDate = (dateVal: any) => {
+  if (!dateVal) return null
+
+  // Jika formatnya angka (Excel Serial Date)
+  if (typeof dateVal === "number") {
+    const date = new Date(Math.round((dateVal - 25569) * 86400 * 1000))
+    return date.toISOString().split("T")[0]
+  }
+
+  // Jika formatnya string (DD-MM-YYYY atau YYYY-MM-DD)
+  const strVal = String(dateVal).trim()
+
+  // Coba parse YYYY-MM-DD
+  if (strVal.match(/^\d{4}-\d{2}-\d{2}$/)) return strVal
+
+  // Coba parse DD-MM-YYYY atau DD/MM/YYYY
+  if (strVal.match(/^\d{1,2}[-/]\d{1,2}[-/]\d{4}$/)) {
+    const parts = strVal.split(/[-/]/)
+    return `${parts[2]}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`
+  }
+
+  return null // Gagal parse
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
@@ -9,142 +42,218 @@ export async function POST(request: NextRequest) {
 
     if (!file) {
       return NextResponse.json(
-        { message: "File tidak ditemukan" },
+        { error: "Tidak ada file yang diunggah" },
         { status: 400 }
       )
     }
 
+    const supabase = createAdminClient()
+
+    // 1. Baca File Excel
     const buffer = await file.arrayBuffer()
-    const workbook = XLSX.read(buffer, { type: "array" })
-    const worksheet = workbook.Sheets[workbook.SheetNames[0]]
-    
-    // Find the actual header row by looking for "Nama" keyword
-    const allRows = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[]
-    let headerRowIndex = 0
-    
-    for (let i = 0; i < Math.min(allRows.length, 10); i++) {
-      const row = allRows[i]
-      if (Array.isArray(row) && row.some((cell: any) => 
-        typeof cell === 'string' && 
-        cell.toLowerCase().includes('nama')
-      )) {
+    const workbook = XLSX.read(buffer, { type: "buffer" })
+    const sheetName = workbook.SheetNames[0] // Ambil sheet pertama
+    const sheet = workbook.Sheets[sheetName]
+
+    // Konversi ke Array of Arrays untuk inspeksi manual
+    const rawData = (XLSX.utils.sheet_to_json(sheet, { header: 1 }) as any[][]) || []
+
+    if (rawData.length === 0) {
+      return NextResponse.json({ error: "File Excel kosong" }, { status: 400 })
+    }
+
+    // 2. DETEKSI HEADER OTOMATIS
+    // Cari baris yang mengandung kata kunci "Nama" dan ("NIP" atau "NIDN" atau "NIDK")
+    let headerRowIndex = -1
+    let colMap: Record<string, number> = {}
+
+    for (let i = 0; i < Math.min(rawData.length, 20); i++) {
+      const row = rawData[i].map((cell) => String(cell).toLowerCase().trim())
+
+      // Kriteria: Baris harus punya kolom "nama" DAN ("nip" atau "nidn" atau "nidk")
+      if (
+        row.includes("nama") &&
+        (row.includes("nip") || row.includes("nidn") || row.includes("nidk"))
+      ) {
         headerRowIndex = i
+
+        // Mapping index kolom berdasarkan header yang ditemukan
+        row.forEach((cell, index) => {
+          if (cell.includes("nama")) colMap["nama"] = index
+          else if (cell === "nip") colMap["nip"] = index
+          else if (cell === "nidn") colMap["nidn"] = index
+          else if (cell === "nidk") colMap["nidk"] = index
+          else if (cell === "nuptk") colMap["nuptk"] = index
+          else if (cell === "l/p" || cell === "gender" || cell === "jenis kelamin")
+            colMap["gender"] = index
+          else if (cell.includes("email")) colMap["email"] = index
+          else if (cell.includes("tanggal lahir") || cell === "tgl lahir") {
+            if (!colMap["tgl_lahir"]) colMap["tgl_lahir"] = index
+          } else if (cell.includes("jabatan") || cell === "fungsional")
+            colMap["jabatan"] = index
+          else if (cell.includes("pangkat") || cell.includes("gol")) colMap["pangkat"] = index
+          else if (cell.includes("departemen") || cell.includes("bagian") || cell.includes("prodi"))
+            colMap["prodi"] = index
+          else if (cell.includes("telepon") || cell.includes("hp") || cell.includes("no."))
+            colMap["phone"] = index
+          else if (cell.includes("unit") || cell.includes("kerja")) colMap["unit_kerja"] = index
+        })
         break
       }
     }
 
-    // Parse from the correct header row
-    const dataRows = XLSX.utils.sheet_to_json(worksheet, {
-      range: headerRowIndex
-    }) as any[]
+    if (headerRowIndex === -1) {
+      return NextResponse.json(
+        {
+          error:
+            'Format header tidak dikenali. Pastikan ada kolom "Nama" dan "NIP/NIDN/NIDK".',
+        },
+        { status: 400 }
+      )
+    }
 
-    const supabase = createAdminClient()
-    const results = { success: 0, failed: 0, errors: [] as string[], warnings: [] as string[] }
+    // 3. Proses Data
+    const errors: string[] = []
+    let successCount = 0
 
-    // Helper function to find value by multiple column name variations
-    const getValue = (row: any, columnAliases: string[]): string | null => {
-      for (const alias of columnAliases) {
-        const value = row[alias]
-        if (value !== undefined && value !== null && value !== '') {
-          return String(value).trim()
-        }
+    // Loop mulai dari baris setelah header
+    for (let i = headerRowIndex + 1; i < rawData.length; i++) {
+      const row = rawData[i]
+
+      // Skip baris kosong
+      if (!row || row.length === 0) continue
+
+      const nama = cleanString(row[colMap["nama"]])
+
+      // Jika tidak ada nama, kemungkinan baris kosong atau footer
+      if (!nama) continue
+
+      const nip = cleanString(row[colMap["nip"]])
+      const nidn = cleanString(row[colMap["nidn"]])
+      const nidk = cleanString(row[colMap["nidk"]])
+      const nuptk = cleanString(row[colMap["nuptk"]])
+      const rawGender = cleanString(row[colMap["gender"]])
+
+      // Normalisasi Gender
+      let gender = null
+      if (rawGender) {
+        if (rawGender.toLowerCase().startsWith("l")) gender = "L"
+        else if (rawGender.toLowerCase().startsWith("p")) gender = "P"
       }
-      return null
-    }
 
-    // Column name aliases for flexible mapping
-    const columnMappings = {
-      nama: ['Nama', 'NAMA', 'nama', 'Full Name', 'Nama Dosen'],
-      nidn: ['NIDN', 'Nomor NIDN', 'nidn', 'NIDN ', ' NIDN'],
-      nidk: ['NIDK', 'Nomor NIDK', 'nidk'],
-      nuptk: ['NUPTK', 'Nomor NUPTK', 'nuptk'],
-      email: ['Email', 'EMAIL', 'email', 'E-mail', 'Email Dosen'],
-      phone: ['Telepon', 'Telp', 'Phone', 'No. Telepon', 'HP', 'No HP'],
-      department: ['Departemen', 'Dept', 'Department', 'Unit Kerja', 'Departemen Departemen'],
-      rank: ['Jabatan Akademik', 'Rank', 'Pangkat', 'Akademik Rank', 'Jabatan'],
-      position: ['Posisi', 'Position', 'Posisi Fakultas', 'Faculty Position'],
-    }
+      const tgl_lahir = parseExcelDate(row[colMap["tgl_lahir"]])
 
-    for (let i = 0; i < dataRows.length; i++) {
-      const row = dataRows[i]
-      
-      // Skip empty rows
-      if (!row || Object.keys(row).length === 0) {
+      // Tentukan identification type dari data yang tersedia
+      let identification_type = ""
+      let identification_number = ""
+
+      if (nidn) {
+        identification_type = "NIDN"
+        identification_number = nidn
+      } else if (nidk) {
+        identification_type = "NIDK"
+        identification_number = nidk
+      } else if (nuptk) {
+        identification_type = "NUPTK"
+        identification_number = nuptk
+      }
+
+      // Validasi data wajib
+      if (!nama || !identification_number) {
+        errors.push(`Baris ${i + 1}: Nama dan nomor identifikasi (NIP/NIDN/NIDK) wajib diisi`)
         continue
       }
 
+      // Data Object untuk Supabase dosen_members
+      const dosenData = {
+        nip: nip || `${identification_type}-${identification_number}`,
+        full_name: nama.replace(/[""'']/g, "").trim(),
+        gender: gender,
+        date_of_birth: tgl_lahir,
+        email: cleanString(row[colMap["email"]]) || `${nama.toLowerCase().replace(/\s+/g, ".")}@unand.ac.id`,
+        phone: cleanString(row[colMap["phone"]]),
+        department: cleanString(row[colMap["prodi"]]),
+        rank_golongan: cleanString(row[colMap["pangkat"]]),
+        position_functional: cleanString(row[colMap["jabatan"]]),
+        unit_kerja: cleanString(row[colMap["unit_kerja"]]),
+        is_active: true,
+      }
+
       try {
-        // Extract data with flexible column mapping
-        const full_name = getValue(row, columnMappings.nama)
-        const nidn = getValue(row, columnMappings.nidn)
-        const nidk = getValue(row, columnMappings.nidk)
-        const nuptk = getValue(row, columnMappings.nuptk)
-        
-        const identification_number = nidn || nidk || nuptk || ""
-        const identification_type = nidn ? "NIDN" : nidk ? "NIDK" : nuptk ? "NUPTK" : ""
+        // Cek apakah dosen dengan NIP sudah ada
+        const existingNip = nip
+          ? await supabase
+              .from("dosen_members")
+              .select("id")
+              .eq("nip", nip)
+              .single()
+          : null
 
-        // Validate required fields with detailed error messaging
-        const validationErrors: string[] = []
-        
-        if (!full_name) {
-          validationErrors.push("Nama dosen tidak ditemukan")
-        }
-        
-        if (!identification_number) {
-          validationErrors.push("Nomor identifikasi (NIDN/NIDK/NUPTK) tidak ditemukan")
-        }
+        let dosenId = existingNip?.data?.id
+        let dosenInsertError = null
 
-        if (validationErrors.length > 0) {
-          results.errors.push(`Baris ${i + headerRowIndex + 2}: ${validationErrors.join("; ")}`)
-          results.failed++
-          continue
-        }
-
-        // Clean data before insertion
-        const cleanedData = {
-          full_name: full_name!.replace(/[""'']/g, '').trim(),
-          identification_type,
-          identification_number: identification_number.replace(/[^\d]/g, ''),
-          email: getValue(row, columnMappings.email) || null,
-          phone: getValue(row, columnMappings.phone) || null,
-          department: getValue(row, columnMappings.department) || null,
-          academic_rank: getValue(row, columnMappings.rank) || null,
-          faculty_position: getValue(row, columnMappings.position) || null,
-          qualification: null,
-          specialization: null,
-          is_active: true,
-        }
-
-        // Additional validation for cleaned data
-        if (cleanedData.identification_number.length === 0) {
-          results.errors.push(`Baris ${i + headerRowIndex + 2}: Nomor identifikasi hanya berisi non-numerik`)
-          results.failed++
-          continue
-        }
-
-        const { error } = await supabase.from("dosen_members").insert([cleanedData])
-
-        if (error) {
-          results.errors.push(`Baris ${i + headerRowIndex + 2}: ${error.message}`)
-          results.failed++
+        if (existingNip?.data?.id) {
+          // Update existing
+          const { error } = await supabase
+            .from("dosen_members")
+            .update(dosenData)
+            .eq("id", dosenId)
+          dosenInsertError = error
         } else {
-          results.success++
+          // Insert baru
+          const { data, error } = await supabase
+            .from("dosen_members")
+            .insert([dosenData])
+            .select("id")
+            .single()
+          dosenId = data?.id
+          dosenInsertError = error
         }
+
+        if (dosenInsertError) {
+          errors.push(`Baris ${i + 1}: ${nama} - ${dosenInsertError.message}`)
+          continue
+        }
+
+        // Jika ada identification type, simpan ke dosen_identification
+        if (dosenId && identification_type) {
+          const { error: identError } = await supabase
+            .from("dosen_identification")
+            .upsert(
+              {
+                dosen_id: dosenId,
+                identification_type,
+                identification_number,
+              },
+              { onConflict: "identification_type,identification_number" }
+            )
+
+          if (identError) {
+            console.error(`[v0] Error saving identification for ${nama}:`, identError)
+            // Jangan gagalkan proses, cukup log saja
+          }
+        }
+
+        successCount++
       } catch (error) {
-        results.errors.push(
-          `Baris ${i + headerRowIndex + 2}: ${error instanceof Error ? error.message : "Terjadi kesalahan"}`
+        errors.push(
+          `Baris ${i + 1}: ${error instanceof Error ? error.message : "Terjadi kesalahan"}`
         )
-        results.failed++
       }
     }
 
-    return NextResponse.json(results)
-  } catch (error) {
-    console.error("[v0] Dosen upload error:", error)
+    return NextResponse.json({
+      message: "Proses upload selesai",
+      success: true,
+      count: successCount,
+      errors: errors.length > 0 ? errors : undefined,
+      totalRows: rawData.length - (headerRowIndex + 1),
+    })
+  } catch (error: any) {
+    console.error("[v0] Upload error:", error)
     return NextResponse.json(
-      { 
-        message: "Gagal upload file. Pastikan file adalah Excel/CSV dengan format yang sesuai.",
-        error: error instanceof Error ? error.message : "Unknown error"
+      {
+        error: "Terjadi kesalahan internal: " + error.message,
       },
       { status: 500 }
     )
