@@ -16,9 +16,11 @@ import { AlertCircle, Upload, CheckCircle2, Info } from "lucide-react"
 import { Progress } from "@/components/ui/progress"
 
 interface UploadResult {
-  success: number
-  failed: number
-  errors: string[]
+  success: boolean
+  message: string
+  success_count: number
+  error_count: number
+  errors?: string[]
 }
 
 interface DosenExcelUploaderProps {
@@ -72,12 +74,12 @@ export function DosenExcelUploader({
         body: formData,
       })
 
-      if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.message || "Gagal upload file")
+      const data = await response.json()
+
+      if (!data.success) {
+        throw new Error(data.error || "Gagal upload file")
       }
 
-      const data = await response.json()
       setResult(data)
       onSuccess?.()
     } catch (err) {
@@ -121,14 +123,14 @@ export function DosenExcelUploader({
 
         {result ? (
           <div className="space-y-4">
-            <Alert className={result.failed === 0 ? "border-green-200 bg-green-50" : "border-amber-200 bg-amber-50"}>
-              <CheckCircle2 className={result.failed === 0 ? "text-green-600" : "text-amber-600"} />
-              <AlertDescription className={result.failed === 0 ? "text-green-800" : "text-amber-800"}>
-                {result.success} data berhasil{result.failed > 0 && `, ${result.failed} gagal`}
+            <Alert className={result.error_count === 0 ? "border-green-200 bg-green-50" : "border-amber-200 bg-amber-50"}>
+              <CheckCircle2 className={result.error_count === 0 ? "text-green-600" : "text-amber-600"} />
+              <AlertDescription className={result.error_count === 0 ? "text-green-800" : "text-amber-800"}>
+                {result.success_count} data berhasil{result.error_count > 0 && `, ${result.error_count} gagal`}
               </AlertDescription>
             </Alert>
 
-            {result.errors.length > 0 && (
+            {result.errors && result.errors.length > 0 && (
               <Alert variant="destructive">
                 <AlertCircle className="h-4 w-4" />
                 <AlertDescription>
